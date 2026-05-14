@@ -1,17 +1,17 @@
-name: Download and Split Large File
+name: Download and Split Large File (Libgen compatible)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'لینک فایل برای دانلود'
+        description: 'لینک فایل (حتی لینک‌های لیبجن)'
         required: true
       filename:
-        description: 'نام فایل (اختیاری - در غیر این صورت از لینک تشخیص داده می‌شود)'
+        description: 'نام فایل (اختیاری)'
         required: false
         default: ''
       target_dir:
-        description: 'دایرکتوری مقصد در ریپازیتوری'
+        description: 'دایرکتوری مقصد'
         required: false
         default: 'downloads'
 
@@ -23,10 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5    # ✅ به نسخه 5 به‌روزرسانی شد
+        uses: actions/checkout@v5
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y coreutils curl
+        run: sudo apt-get update && sudo apt-get install -y coreutils curl file
 
       - name: Prepare target directory
         run: mkdir -p "${{ inputs.target_dir }}"
@@ -38,25 +38,90 @@ jobs:
             echo "name=${{ inputs.filename }}" >> $GITHUB_OUTPUT
           else
             URL="${{ inputs.url }}"
-            FILE_NAME=$(basename "$URL" | sed 's/\?.*//')
-            if [ -z "$FILE_NAME" ]; then
-              FILE_NAME="downloaded_file"
+            # اگر لینک لیبجن بود، نام فایل را از پارامتر md5 می‌گیریم
+            if [[ "$URL" == *"md5="* ]]; then
+              MD5=$(echo "$URL" | grep -oP 'md5=\K[^&]+')
+              echo "name=${MD5}.pdf" >> $GITHUB_OUTPUT
+            else
+              FILE_NAME=$(basename "$URL" | sed 's/\?.*//')
+              [ -z "$FILE_NAME" ] && FILE_NAME="downloaded_file"
+              echo "name=$FILE_NAME" >> $GITHUB_OUTPUT
             fi
-            echo "name=$FILE_NAME" >> $GITHUB_OUTPUT
           fi
 
-      - name: Download file
+      - name: Smart download (handles libgen)
         run: |
-          # ✅ اضافه کردن --http1.1 برای رفع خطای 92
-          curl -L --http1.1 --retry 3 -o "${{ steps.filename.outputs.name }}" "${{ inputs.url }}"
-          echo "Download completed"
+          URL="${{ inputs.url }}"
+          OUTPUT_FILE="${{ steps.filename.outputs.name }}"
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          REFERER="https://libgen.is/"
+          COOKIE_JAR="cookies.txt"
+          
+          # درخواست اول با رعایت هدرها و ذخیره کوکی
+          curl -L --http1.1 --retry 3 \
+               -A "$USER_AGENT" \
+               -e "$REFERER" \
+               -c "$COOKIE_JAR" \
+               -b "$COOKIE_JAR" \
+               -o "temp_download" \
+               "$URL"
+          
+          # بررسی نوع فایل
+          if file "temp_download" | grep -q "HTML"; then
+            echo "HTML page detected. Extracting real download link..."
+            
+            # روش 1: جستجوی لینک مستقیم (.pdf, .epub, ...)
+            REAL_URL=$(grep -oP 'href="\K[^"]+\.(pdf|epub|djvu|mobi|azw3)[^"]*' temp_download | head -1)
+            
+            # روش 2: جستجوی پنجره‌ها یا meta refresh
+            if [ -z "$REAL_URL" ]; then
+              REAL_URL=$(grep -oP "window\.location\.href\s*=\s*'\K[^']+" temp_download | head -1)
+            fi
+            if [ -z "$REAL_URL" ]; then
+              REAL_URL=$(grep -oP "http-equiv=\"refresh\" content=\"[0-9]+;url='\K[^']+" temp_download | head -1)
+            fi
+            # روش 3: هر لینکی که شامل md5 همان باشد
+            if [ -z "$REAL_URL" ]; then
+              MD5_FROM_URL=$(echo "$URL" | grep -oP 'md5=\K[^&]+')
+              [ -n "$MD5_FROM_URL" ] && REAL_URL=$(grep -oP "href=\"[^\"]*${MD5_FROM_URL}[^\"]*" temp_download | head -1 | sed 's/href="//')
+            fi
+            
+            if [ -n "$REAL_URL" ]; then
+              # تبدیل به آدرس کامل
+              if [[ "$REAL_URL" == //* ]]; then
+                REAL_URL="https:$REAL_URL"
+              elif [[ "$REAL_URL" == /* ]]; then
+                REAL_URL="https://libgen.is$REAL_URL"
+              elif [[ "$REAL_URL" != http* ]]; then
+                REAL_URL="https://libgen.is/$REAL_URL"
+              fi
+              echo "Real file URL: $REAL_URL"
+              
+              # دانلود فایل واقعی
+              curl -L --http1.1 --retry 3 \
+                   -A "$USER_AGENT" \
+                   -e "$REFERER" \
+                   -b "$COOKIE_JAR" \
+                   -o "$OUTPUT_FILE" \
+                   "$REAL_URL"
+            else
+              echo "ERROR: Could not find download link. The HTML content was:"
+              head -n 20 temp_download
+              exit 1
+            fi
+          else
+            # فایل واقعی مستقیماً دریافت شده
+            mv temp_download "$OUTPUT_FILE"
+          fi
+          
+          echo "Download finished. File: $OUTPUT_FILE"
 
-      - name: Get file size
+      - name: Get file size and split if needed
         id: filesize
         run: |
           SIZE=$(stat -c%s "${{ steps.filename.outputs.name }}")
           echo "size=$SIZE" >> $GITHUB_OUTPUT
-          MAX_SIZE=104857600  # 100 MiB
+          MAX_SIZE=104857600
           if [ $SIZE -gt $MAX_SIZE ]; then
             echo "needs_split=true" >> $GITHUB_OUTPUT
           else
@@ -66,7 +131,7 @@ jobs:
       - name: Move small file to target directory
         if: steps.filesize.outputs.needs_split == 'false'
         run: |
-          mv "${{ steps.filename.outputs.name }}" "${{ inputs.target_dir }}/${{ steps.filename.outputs.name }}"
+          mv "${{ steps.filename.outputs.name }}" "${{ inputs.target_dir }}/"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "${{ inputs.target_dir }}/${{ steps.filename.outputs.name }}"
@@ -79,40 +144,27 @@ jobs:
           ORIGINAL="${{ steps.filename.outputs.name }}"
           TARGET_DIR="${{ inputs.target_dir }}/${ORIGINAL}_parts"
           mkdir -p "$TARGET_DIR"
-
           split -b 95M -d -a 3 "$ORIGINAL" "$TARGET_DIR/part_"
-
           cat > "$TARGET_DIR/manifest.txt" << EOF
           original_filename=$ORIGINAL
           part_count=$(ls "$TARGET_DIR"/part_* | wc -l)
           part_prefix=part_
           EOF
-
           cat > "$TARGET_DIR/reassemble.sh" << 'EOF'
           #!/bin/bash
-          MANIFEST="manifest.txt"
-          if [ ! -f "$MANIFEST" ]; then
-            echo "manifest.txt not found!"
-            exit 1
-          fi
-          source "$MANIFEST"
-          OUTPUT="../$original_filename"
-          cat ${part_prefix}* > "$OUTPUT"
-          echo "Reassembled file: $OUTPUT"
+          source manifest.txt
+          cat ${part_prefix}* > "../$original_filename"
+          echo "Reassembled file: ../$original_filename"
           EOF
-
           chmod +x "$TARGET_DIR/reassemble.sh"
           rm "$ORIGINAL"
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$TARGET_DIR"
-          git commit -m "Split large file $ORIGINAL into parts (95MB each)"
+          git commit -m "Split large file $ORIGINAL into parts"
           git push
-
-          echo "✅ File was larger than 100MB and has been split into parts."
-          echo "📂 Parts location: $TARGET_DIR"
-          echo "🔧 To reassemble, go into that folder and run: ./reassemble.sh"
+          echo "✅ File split into parts."
+          echo "🔧 To reassemble: cd $TARGET_DIR && ./reassemble.sh"
 
       - name: Completion message
-        run: echo "🎉 Action finished successfully."
+        run: echo "🎉 Action completed."
