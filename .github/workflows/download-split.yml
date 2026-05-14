@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5    # ✅ به نسخه 5 به‌روزرسانی شد
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y coreutils curl
@@ -37,7 +37,6 @@ jobs:
           if [ -n "${{ inputs.filename }}" ]; then
             echo "name=${{ inputs.filename }}" >> $GITHUB_OUTPUT
           else
-            # extract filename from URL (last part after /)
             URL="${{ inputs.url }}"
             FILE_NAME=$(basename "$URL" | sed 's/\?.*//')
             if [ -z "$FILE_NAME" ]; then
@@ -48,7 +47,8 @@ jobs:
 
       - name: Download file
         run: |
-          curl -L --retry 3 -o "${{ steps.filename.outputs.name }}" "${{ inputs.url }}"
+          # ✅ اضافه کردن --http1.1 برای رفع خطای 92
+          curl -L --http1.1 --retry 3 -o "${{ steps.filename.outputs.name }}" "${{ inputs.url }}"
           echo "Download completed"
 
       - name: Get file size
@@ -80,20 +80,16 @@ jobs:
           TARGET_DIR="${{ inputs.target_dir }}/${ORIGINAL}_parts"
           mkdir -p "$TARGET_DIR"
 
-          # Split using 95MB parts (safe under GitHub 100MB limit)
           split -b 95M -d -a 3 "$ORIGINAL" "$TARGET_DIR/part_"
 
-          # Create a manifest file
           cat > "$TARGET_DIR/manifest.txt" << EOF
           original_filename=$ORIGINAL
           part_count=$(ls "$TARGET_DIR"/part_* | wc -l)
           part_prefix=part_
           EOF
 
-          # Create reassemble script
           cat > "$TARGET_DIR/reassemble.sh" << 'EOF'
           #!/bin/bash
-          # Run this script in the directory where the parts are located
           MANIFEST="manifest.txt"
           if [ ! -f "$MANIFEST" ]; then
             echo "manifest.txt not found!"
@@ -106,11 +102,8 @@ jobs:
           EOF
 
           chmod +x "$TARGET_DIR/reassemble.sh"
-
-          # Remove original large file
           rm "$ORIGINAL"
 
-          # Commit everything
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$TARGET_DIR"
@@ -122,5 +115,4 @@ jobs:
           echo "🔧 To reassemble, go into that folder and run: ./reassemble.sh"
 
       - name: Completion message
-        run: |
-          echo "🎉 Action finished successfully."
+        run: echo "🎉 Action finished successfully."
