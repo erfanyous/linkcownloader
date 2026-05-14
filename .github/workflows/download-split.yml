@@ -1,0 +1,126 @@
+name: Download and Split Large File
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لینک فایل برای دانلود'
+        required: true
+      filename:
+        description: 'نام فایل (اختیاری - در غیر این صورت از لینک تشخیص داده می‌شود)'
+        required: false
+        default: ''
+      target_dir:
+        description: 'دایرکتوری مقصد در ریپازیتوری'
+        required: false
+        default: 'downloads'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y coreutils curl
+
+      - name: Prepare target directory
+        run: mkdir -p "${{ inputs.target_dir }}"
+
+      - name: Determine filename
+        id: filename
+        run: |
+          if [ -n "${{ inputs.filename }}" ]; then
+            echo "name=${{ inputs.filename }}" >> $GITHUB_OUTPUT
+          else
+            # extract filename from URL (last part after /)
+            URL="${{ inputs.url }}"
+            FILE_NAME=$(basename "$URL" | sed 's/\?.*//')
+            if [ -z "$FILE_NAME" ]; then
+              FILE_NAME="downloaded_file"
+            fi
+            echo "name=$FILE_NAME" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download file
+        run: |
+          curl -L --retry 3 -o "${{ steps.filename.outputs.name }}" "${{ inputs.url }}"
+          echo "Download completed"
+
+      - name: Get file size
+        id: filesize
+        run: |
+          SIZE=$(stat -c%s "${{ steps.filename.outputs.name }}")
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          MAX_SIZE=104857600  # 100 MiB
+          if [ $SIZE -gt $MAX_SIZE ]; then
+            echo "needs_split=true" >> $GITHUB_OUTPUT
+          else
+            echo "needs_split=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Move small file to target directory
+        if: steps.filesize.outputs.needs_split == 'false'
+        run: |
+          mv "${{ steps.filename.outputs.name }}" "${{ inputs.target_dir }}/${{ steps.filename.outputs.name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ inputs.target_dir }}/${{ steps.filename.outputs.name }}"
+          git commit -m "Add downloaded file: ${{ steps.filename.outputs.name }}"
+          git push
+
+      - name: Split large file into parts (95MB each)
+        if: steps.filesize.outputs.needs_split == 'true'
+        run: |
+          ORIGINAL="${{ steps.filename.outputs.name }}"
+          TARGET_DIR="${{ inputs.target_dir }}/${ORIGINAL}_parts"
+          mkdir -p "$TARGET_DIR"
+
+          # Split using 95MB parts (safe under GitHub 100MB limit)
+          split -b 95M -d -a 3 "$ORIGINAL" "$TARGET_DIR/part_"
+
+          # Create a manifest file
+          cat > "$TARGET_DIR/manifest.txt" << EOF
+          original_filename=$ORIGINAL
+          part_count=$(ls "$TARGET_DIR"/part_* | wc -l)
+          part_prefix=part_
+          EOF
+
+          # Create reassemble script
+          cat > "$TARGET_DIR/reassemble.sh" << 'EOF'
+          #!/bin/bash
+          # Run this script in the directory where the parts are located
+          MANIFEST="manifest.txt"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "manifest.txt not found!"
+            exit 1
+          fi
+          source "$MANIFEST"
+          OUTPUT="../$original_filename"
+          cat ${part_prefix}* > "$OUTPUT"
+          echo "Reassembled file: $OUTPUT"
+          EOF
+
+          chmod +x "$TARGET_DIR/reassemble.sh"
+
+          # Remove original large file
+          rm "$ORIGINAL"
+
+          # Commit everything
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$TARGET_DIR"
+          git commit -m "Split large file $ORIGINAL into parts (95MB each)"
+          git push
+
+          echo "✅ File was larger than 100MB and has been split into parts."
+          echo "📂 Parts location: $TARGET_DIR"
+          echo "🔧 To reassemble, go into that folder and run: ./reassemble.sh"
+
+      - name: Completion message
+        run: |
+          echo "🎉 Action finished successfully."
