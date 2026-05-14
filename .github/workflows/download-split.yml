@@ -1,4 +1,4 @@
-name: Download and Split Large File (Libgen compatible)
+name: Download and Split Large File (Libgen compatible - final)
 
 on:
   workflow_dispatch:
@@ -55,68 +55,98 @@ jobs:
           USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           REFERER="https://libgen.is/"
           COOKIE_JAR="cookies.txt"
+          MAX_TRIES=5
+          MIN_SIZE=5000
           
-          curl -L --http1.1 --retry 5 --retry-delay 2 \
-               -A "$USER_AGENT" -e "$REFERER" \
-               -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-               -o "temp_download" "$URL"
-          
-          if file "temp_download" | grep -q "HTML"; then
-            echo "HTML page detected. Extracting real download link..."
-            REAL_URL=$(grep -oP 'href="\K[^"]+\.(pdf|epub|djvu|mobi|azw3)[^"]*' temp_download | head -1)
-            [ -z "$REAL_URL" ] && REAL_URL=$(grep -oP "window\.location\.href\s*=\s*'\K[^']+" temp_download | head -1)
-            [ -z "$REAL_URL" ] && REAL_URL=$(grep -oP "http-equiv=\"refresh\" content=\"[0-9]+;url='\K[^']+" temp_download | head -1)
-            if [ -z "$REAL_URL" ]; then
-              MD5_FROM_URL=$(echo "$URL" | grep -oP 'md5=\K[^&]+')
-              [ -n "$MD5_FROM_URL" ] && REAL_URL=$(grep -oP "href=\"[^\"]*${MD5_FROM_URL}[^\"]*" temp_download | head -1 | sed 's/href="//')
-            fi
-            if [ -n "$REAL_URL" ]; then
-              [[ "$REAL_URL" == //* ]] && REAL_URL="https:$REAL_URL"
-              [[ "$REAL_URL" == /* ]] && REAL_URL="https://libgen.is$REAL_URL"
-              [[ "$REAL_URL" != http* ]] && REAL_URL="https://libgen.is/$REAL_URL"
-              echo "Real file URL: $REAL_URL"
+          get_real_url() {
+            curl -L --http1.1 --retry 3 \
+                 -A "$USER_AGENT" -e "$REFERER" \
+                 -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                 -o "temp_page" "$1"
+            if file "temp_page" | grep -q "HTML"; then
+              REAL=$(grep -oP 'href="\K[^"]+\.(pdf|epub|djvu|mobi|azw3)[^"]*' temp_page | head -1)
+              [ -z "$REAL" ] && REAL=$(grep -oP "window\.location\.href\s*=\s*'\K[^']+" temp_page | head -1)
+              [ -z "$REAL" ] && REAL=$(grep -oP "http-equiv=\"refresh\" content=\"[0-9]+;url='\K[^']+" temp_page | head -1)
+              if [ -z "$REAL" ]; then
+                MD5_FROM_URL=$(echo "$1" | grep -oP 'md5=\K[^&]+')
+                [ -n "$MD5_FROM_URL" ] && REAL=$(grep -oP "href=\"[^\"]*${MD5_FROM_URL}[^\"]*" temp_page | head -1 | sed 's/href="//')
+              fi
+              if [ -n "$REAL" ]; then
+                [[ "$REAL" == //* ]] && REAL="https:$REAL"
+                [[ "$REAL" == /* ]] && REAL="https://libgen.is$REAL"
+                [[ "$REAL" != http* ]] && REAL="https://libgen.is/$REAL"
+                echo "$REAL"
+              else
+                echo ""
+              fi
             else
-              echo "ERROR: Could not find download link. HTML content:"
-              head -n 20 temp_download
-              exit 1
+              echo "$1"
             fi
-          else
-            REAL_URL="$URL"
+          }
+          
+          REAL_URL=$(get_real_url "$URL")
+          if [ -z "$REAL_URL" ]; then
+            echo "ERROR: Could not extract download link"
+            cat temp_page
+            exit 1
           fi
+          echo "Real URL: $REAL_URL"
           
-          echo "Starting robust download with resume and high retry..."
-          rm -f "$OUTPUT_FILE"
-          curl -L --http1.1 \
-               --retry 10 --retry-delay 3 --retry-connrefused \
-               --continue-at - \
-               --max-time 600 --connect-timeout 30 \
-               -A "$USER_AGENT" -e "$REFERER" -b "$COOKIE_JAR" \
-               -H "Accept-Encoding: gzip, deflate" \
-               -o "$OUTPUT_FILE" \
-               "$REAL_URL"
-          
-          if [ ! -f "$OUTPUT_FILE" ]; then
-            echo "curl failed. Trying wget fallback..."
-            wget --tries=10 --timeout=30 --continue \
+          for try in $(seq 1 $MAX_TRIES); do
+            echo "Download attempt $try of $MAX_TRIES"
+            rm -f "$OUTPUT_FILE"
+            
+            wget --tries=3 --timeout=30 --retry-connrefused \
                  --header="User-Agent: $USER_AGENT" \
                  --header="Referer: $REFERER" \
                  --load-cookies="$COOKIE_JAR" \
+                 --no-check-certificate \
                  -O "$OUTPUT_FILE" \
-                 "$REAL_URL"
-          fi
-          
-          if [ -f "$OUTPUT_FILE" ]; then
-            SIZE=$(stat -c%s "$OUTPUT_FILE")
-            if [ "$SIZE" -lt 5000 ]; then
-              echo "ERROR: Downloaded file too small ($SIZE bytes). Content:"
-              cat "$OUTPUT_FILE"
+                 "$REAL_URL" 2> wget_log.txt
+            
+            if [ -f "$OUTPUT_FILE" ]; then
+              SIZE=$(stat -c%s "$OUTPUT_FILE")
+              if [ "$SIZE" -ge "$MIN_SIZE" ]; then
+                echo "Download successful. Size: $SIZE bytes"
+                break
+              else
+                echo "Downloaded file too small ($SIZE bytes). Retrying..."
+                cat "$OUTPUT_FILE"
+              fi
+            else
+              echo "wget failed, trying curl..."
+              curl -L --http1.1 --retry 5 --retry-delay 3 \
+                   -A "$USER_AGENT" -e "$REFERER" -b "$COOKIE_JAR" \
+                   -o "$OUTPUT_FILE" \
+                   "$REAL_URL"
+              if [ -f "$OUTPUT_FILE" ]; then
+                SIZE=$(stat -c%s "$OUTPUT_FILE")
+                if [ "$SIZE" -ge "$MIN_SIZE" ]; then
+                  echo "curl succeeded. Size: $SIZE bytes"
+                  break
+                fi
+              fi
+            fi
+            
+            echo "Refreshing download link..."
+            REAL_URL=$(get_real_url "$URL")
+            if [ -z "$REAL_URL" ]; then
+              echo "Failed to get new link"
               exit 1
             fi
-            echo "Download successful. File size: $SIZE bytes"
-          else
-            echo "ERROR: Download failed completely."
+            echo "New Real URL: $REAL_URL"
+          done
+          
+          if [ ! -f "$OUTPUT_FILE" ]; then
+            echo "All download attempts failed."
             exit 1
           fi
+          FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE")
+          if [ "$FINAL_SIZE" -lt "$MIN_SIZE" ]; then
+            echo "Final file too small ($FINAL_SIZE bytes). Aborting."
+            exit 1
+          fi
+          echo "Download completed successfully. File: $OUTPUT_FILE ($FINAL_SIZE bytes)"
 
       - name: Get file size and split if needed
         id: filesize
