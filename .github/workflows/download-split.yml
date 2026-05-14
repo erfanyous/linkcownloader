@@ -1,112 +1,151 @@
-- name: Smart download with retry and resume
-  run: |
-    URL="${{ inputs.url }}"
-    OUTPUT_FILE="${{ steps.filename.outputs.name }}"
-    USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    REFERER="https://libgen.is/"
-    COOKIE_JAR="cookies.txt"
-    MAX_RETRIES=5
-    RETRY_DELAY=10
+name: Download from Libgen (Split Large Files)
 
-    # تابع دانلود با curl و resume
-    download_with_curl() {
-      local url=$1
-      local output=$2
-      curl -L --http1.1 \
-           --retry $MAX_RETRIES \
-           --retry-delay $RETRY_DELAY \
-           --retry-all-errors \
-           --continue-at - \
-           -A "$USER_AGENT" \
-           -e "$REFERER" \
-           -b "$COOKIE_JAR" \
-           -c "$COOKIE_JAR" \
-           -o "$output" \
-           "$url"
-      return $?
-    }
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لیبجن لینک (حتی با key و md5)'
+        required: true
+      filename:
+        description: 'نام فایل (اختیاری)'
+        required: false
+        default: ''
+      target_dir:
+        description: 'پوشه ذخیره در ریپازیتوری'
+        required: false
+        default: 'downloads'
 
-    # مرحله 1: دریافت صفحه HTML یا ریدایرکت
-    curl -L --http1.1 --retry 3 \
-         -A "$USER_AGENT" \
-         -e "$REFERER" \
-         -c "$COOKIE_JAR" \
-         -b "$COOKIE_JAR" \
-         -o "temp_download" \
-         "$URL"
+permissions:
+  contents: write
 
-    # بررسی نوع محتوا
-    if file "temp_download" | grep -q "HTML"; then
-      echo "HTML page detected. Extracting real download link..."
-      
-      # استخراج لینک واقعی (همان منطق قبلی)
-      REAL_URL=$(grep -oP 'href="\K[^"]+\.(pdf|epub|djvu|mobi|azw3)[^"]*' temp_download | head -1)
-      if [ -z "$REAL_URL" ]; then
-        REAL_URL=$(grep -oP "window\.location\.href\s*=\s*'\K[^']+" temp_download | head -1)
-      fi
-      if [ -z "$REAL_URL" ]; then
-        REAL_URL=$(grep -oP "http-equiv=\"refresh\" content=\"[0-9]+;url='\K[^']+" temp_download | head -1)
-      fi
-      if [ -z "$REAL_URL" ]; then
-        MD5_FROM_URL=$(echo "$URL" | grep -oP 'md5=\K[^&]+')
-        [ -n "$MD5_FROM_URL" ] && REAL_URL=$(grep -oP "href=\"[^\"]*${MD5_FROM_URL}[^\"]*" temp_download | head -1 | sed 's/href="//')
-      fi
-      
-      if [ -n "$REAL_URL" ]; then
-        if [[ "$REAL_URL" == //* ]]; then
-          REAL_URL="https:$REAL_URL"
-        elif [[ "$REAL_URL" == /* ]]; then
-          REAL_URL="https://libgen.is$REAL_URL"
-        elif [[ "$REAL_URL" != http* ]]; then
-          REAL_URL="https://libgen.is/$REAL_URL"
-        fi
-        echo "Real file URL: $REAL_URL"
-        
-        # دانلود فایل واقعی با قابلیت resume
-        echo "Starting download with resume support..."
-        download_with_curl "$REAL_URL" "$OUTPUT_FILE"
-        CURL_EXIT=$?
-      else
-        echo "ERROR: Could not find download link."
-        exit 1
-      fi
-    else
-      # مستقیم فایل بود
-      mv temp_download "$OUTPUT_FILE"
-      CURL_EXIT=0
-    fi
+jobs:
+  robust-download:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
 
-    # بررسی مجدد خطای 18 و تلاش با wget در صورت نیاز
-    if [ $CURL_EXIT -eq 18 ]; then
-      echo "curl exited with code 18 (partial file). Trying wget as fallback..."
-      # استخراج مجدد لینک واقعی اگر لازم بود (در متغیر REAL_URL ذخیره شده)
-      if [ -n "$REAL_URL" ]; then
-        wget --tries=5 --timeout=60 --continue -O "$OUTPUT_FILE" "$REAL_URL"
-        WGET_EXIT=$?
-        if [ $WGET_EXIT -ne 0 ]; then
-          echo "wget also failed with exit code $WGET_EXIT"
-          exit $WGET_EXIT
-        fi
-      else
-        echo "No REAL_URL to retry with wget"
-        exit 18
-      fi
-    elif [ $CURL_EXIT -ne 0 ]; then
-      echo "curl failed with exit code $CURL_EXIT"
-      exit $CURL_EXIT
-    fi
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y curl file coreutils
 
-    # بررسی حجم فایل دانلود شده (اختیاری)
-    if [ -f "$OUTPUT_FILE" ]; then
-      SIZE=$(stat -c%s "$OUTPUT_FILE")
-      echo "Downloaded file size: $SIZE bytes"
-      if [ $SIZE -eq 0 ]; then
-        echo "Error: Downloaded file is empty."
-        exit 1
-      fi
-    else
-      echo "Error: Output file not created."
-      exit 1
-    fi
+      - name: Prepare dir
+        run: mkdir -p "${{ inputs.target_dir }}"
 
-    echo "Download completed successfully."
+      - name: Determine filename
+        id: filename
+        run: |
+          if [ -n "${{ inputs.filename }}" ]; then
+            echo "name=${{ inputs.filename }}" >> $GITHUB_OUTPUT
+          else
+            URL="${{ inputs.url }}"
+            if [[ "$URL" == *"md5="* ]]; then
+              MD5=$(echo "$URL" | grep -oP 'md5=\K[^&]+')
+              echo "name=${MD5}.pdf" >> $GITHUB_OUTPUT
+            else
+              NAME=$(basename "$URL" | sed 's/\?.*//')
+              [ -z "$NAME" ] && NAME="downloaded_file"
+              echo "name=$NAME" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Download with retry & resume (fixes exit 18)
+        run: |
+          URL="${{ inputs.url }}"
+          OUT="${{ steps.filename.outputs.name }}"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          REF="https://libgen.is/"
+          COOKIE="cookies.txt"
+          
+          # Step 1: initial request to get cookies and maybe redirect
+          curl -L --http1.1 --retry 5 --retry-delay 2 \
+               -A "$UA" -e "$REF" -c "$COOKIE" -b "$COOKIE" \
+               -o "temp_first" "$URL"
+          
+          # Step 2: extract real URL if needed
+          if file "temp_first" | grep -q "HTML"; then
+            echo "HTML page received, looking for direct link..."
+            REAL=$(grep -oP 'href="\K[^"]+\.(pdf|epub|djvu|mobi|azw3)(\?[^"]*)?' temp_first | head -1)
+            [ -z "$REAL" ] && REAL=$(grep -oP "window\.location\.href\s*=\s*'\K[^']+" temp_first | head -1)
+            [ -z "$REAL" ] && REAL=$(grep -oP "http-equiv=\"refresh\" content=\"[0-9]+;url='\K[^']+" temp_first | head -1)
+            
+            if [ -n "$REAL" ]; then
+              # make absolute url
+              [[ "$REAL" == //* ]] && REAL="https:$REAL"
+              [[ "$REAL" == /* ]] && REAL="https://libgen.is$REAL"
+              [[ "$REAL" != http* ]] && REAL="https://libgen.is/$REAL"
+              echo "Real URL: $REAL"
+            else
+              echo "ERROR: Could not find download link. HTML content:"
+              head -n 20 temp_first
+              exit 1
+            fi
+          else
+            REAL="$URL"
+          fi
+          
+          # Step 3: download actual file with maximum robustness
+          echo "Starting resilient download..."
+          rm -f "$OUT"
+          curl --retry 10 --retry-delay 3 --retry-connrefused --continue-at - \
+               --max-time 600 --connect-timeout 30 \
+               -A "$UA" -e "$REF" -b "$COOKIE" \
+               -H "Accept-Encoding: gzip, deflate" \
+               -L --http1.1 \
+               -o "$OUT" "$REAL"
+          
+          # Step 4: validate
+          if [ ! -f "$OUT" ]; then
+            echo "Download failed - no output file"
+            exit 1
+          fi
+          
+          SIZE=$(stat -c%s "$OUT")
+          if [ "$SIZE" -lt 5000 ]; then
+            echo "File suspiciously small ($SIZE bytes). Checking content..."
+            if file "$OUT" | grep -q "HTML"; then
+              echo "Error page detected:"
+              cat "$OUT"
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Download successful. File: $OUT, Size: $SIZE bytes"
+
+      - name: Split if >100MB
+        id: split
+        run: |
+          FILE="${{ steps.filename.outputs.name }}"
+          SIZE=$(stat -c%s "$FILE")
+          MAX=104857600
+          if [ $SIZE -gt $MAX ]; then
+            echo "needs_split=true" >> $GITHUB_OUTPUT
+            TARGET_DIR="${{ inputs.target_dir }}/${FILE}_parts"
+            mkdir -p "$TARGET_DIR"
+            split -b 95M -d -a 3 "$FILE" "$TARGET_DIR/part_"
+            cat > "$TARGET_DIR/manifest.txt" << EOF
+original_filename=$FILE
+part_count=$(ls "$TARGET_DIR"/part_* | wc -l)
+part_prefix=part_
+EOF
+            cat > "$TARGET_DIR/reassemble.sh" << 'EOF'
+#!/bin/bash
+cd "$(dirname "$0")"
+source manifest.txt
+cat ${part_prefix}* > "../$original_filename"
+echo "Reassembled: ../$original_filename"
+EOF
+            chmod +x "$TARGET_DIR/reassemble.sh"
+            rm "$FILE"
+            echo "✅ File split into 95MB parts."
+            echo "🔧 To reassemble: cd $TARGET_DIR && ./reassemble.sh"
+          else
+            echo "needs_split=false" >> $GITHUB_OUTPUT
+            mv "$FILE" "${{ inputs.target_dir }}/"
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ inputs.target_dir }}"
+          git diff --staged --quiet || git commit -m "Add downloaded file from libgen"
+          git push
